@@ -9,23 +9,29 @@ from encodings import utf_8
 import numpy as np
 import glob
 import eph_util as ep
+import coarse_time_navigation as ctn
 import xml.etree.ElementTree as et
 from concurrent import futures
+import time as tm
+import matplotlib.pyplot as plt
+
 from rinex_preprocessor import preprocess_rinex
 import pymap3d as pm
 import shapely.geometry as sg
 import os
 
-def worker(data):
+def worker(data, mode, source):
     """Process one snapperGPS dataset with GPS L1.
 
     Inputs:
         data - Uppercase character indicating the SnapperGPS dataset ("A"-"K")
+        mode - CTN Algorithm to use for positioning
+        source - "snapper" or list of directory names containing code_phasess to use for positioning, for the same dataset
+                "snapper" runs the eph.acquisition_simplified to process the snapshot raw data
 
     Output:
-        all_satellites - list of observable satellites, one array for each data
-        all_snrs - list of acquisition SNRs for each observable satellite, one array for each data [dB]
-        all_filenames - list of filenames from the dataset, to match satellites and snrs later on
+        all_errors - dictionnary of errors for "snapper" acquisition and one key for each source
+
     Author: Jonas Beuchert, adapted by Guillaume Thivolet
     """
 
@@ -110,6 +116,22 @@ def worker(data):
     # Get all names of data files
     filenames = glob.glob(os.path.join("data", data, "*.bin"))
 
+    modes = ["ls-single", "ls-linear", "ls-combo", "ls-sac", "mle",
+             "ls-sac/mle", "dpe"]
+    ls_modes = {key: val for key, val in zip(
+        modes, ["single", "snr", "combinatorial", "ransac", None, "ransac",
+                None]
+        )}
+ 
+    mle_modes = {key: val for key, val in zip(
+        modes, [False, False, False, False, True, True, False]
+        )}
+    # Maximum number of satellites for CTN
+    max_sat_count = {key: val for key, val in zip(
+        modes, [5, 15, 10, 15, None, 15]
+        )}
+
+
     gnss_list = ['G']
 
     # Frequency offsets of GNSS front-ends
@@ -132,14 +154,32 @@ def worker(data):
     # Correct intermediate frequency
     intermediate_frequency = intermediate_frequency + frequency_offsets[data]
 
+    # Diameter of temporal search space [s] (MLE and DPE only)
+    search_space_time = {
+        "A": 2.0,
+        "B": 10.0,
+        "C": 2.0,
+        "D": 2.0,
+        "E": 2.0,
+        "F": 2.0,
+        "G": 10.0,
+        "H": 2.0,
+        "I": 2.0,
+        "J": 2.0,
+        "K": 2.0
+        }
+
+
     # Get all names of data files
     filenames = glob.glob(os.path.join("data", data, "*.bin"))
-    all_filenames = []
-    all_satellites = []
-    all_snrs = []
+
+    all_errors = dict()
+
 
     # Iterate over all files
     for idx, filename in enumerate(filenames):
+
+        #filename = 'data/A/20201206_153820.bin'
 
         print('Snapshot {} of {}'.format(idx+1, len(filenames)))
 
@@ -192,11 +232,14 @@ def worker(data):
         snapshot_idx_dict = {}
         prn_dict = {}
         code_phase_dict = {}
+        eph_dict_curr = {}
         snr_dict = {}
 
         # Loop over all GNSS
         for gnss in gnss_list:
-            # Acquisitiong
+            ###################################################################
+            # Acquisition
+            ###################################################################
             snapshot_idx_dict[gnss], prn_dict[gnss], code_phase_dict[gnss], \
                 snr_dict[gnss], eph_idx, _, _ = ep.acquisition_simplified(
                     np.array([signal]),
@@ -208,20 +251,192 @@ def worker(data):
                     frequency_bins=np.linspace(-0, 0, 1),
                     )
 
-            all_satellites.append(prn_dict['G'])
-            all_snrs.append(snr_dict['G'])
-            all_filenames.append(filename)
-        break
+            eph_dict_curr[gnss] = eph_dict[gnss][:, eph_idx]
 
-    return all_satellites, all_snrs, all_filenames
+        #start_time = tm.time()
+
+        ###################################################################
+        # Positioning
+        ###################################################################
+
+        # Estimate all positions with a single function call
+        # Correct timestamps, too
+        # Finally, estimate the horizontal one-sigma uncertainty
+        latitude_estimates, longitude_estimates, time_utc_estimates, \
+            uncertainty_estimates \
+            = ctn.positioning_simplified(
+                    snapshot_idx_dict,
+                    prn_dict,
+                    code_phase_dict,
+                    snr_dict,
+                    eph_dict_curr,
+                    np.array([utc]),
+                    # Initial position goes here or
+                    # if data is processed in mini-batches, last plausible position
+                    pos_geo[0], pos_geo[1], pos_geo[2],
+                    # If we could measure the height, it would go here (WGS84)
+                    observed_heights=None,
+                    # If we measure pressure & temperature, we can estimate the height
+                    pressures=None, temperatures=None,
+                    # There are 5 different modes, 'snr' is fast, but inaccurate
+                    # In the future, 'ransac' might be the preferred option
+                    ls_mode=ls_modes[mode],
+                    # Turn mle on to get a 2nd run if least-squares fails (recommended)
+                    mle=mle_modes[mode],
+                    # This parameter is crucial for speed vs. accuracy/robustness
+                    # 10-15 is good for 'snr', 10 for 'combinatorial', 15 for 'ransac'
+                    max_sat_count=max_sat_count[mode],
+                    # These parameters determine the max. spatial & temporal distance
+                    # between consecutive snapshots to be plausible
+                    # Shall depend on the application scenario
+                    max_dist=15.0e3, max_time=30.0,
+                    # If we would know an initial offset of the timestamps
+                    # If data is processed in mini-batches, the error from previous one
+                    time_error=0.0,
+                    search_space_time=search_space_time[data])
+
+        # Measure time spent on positioning
+        #all_time.append(tm.time() - start_time)
+
+        # Calculate positioning error in ENU coordinates [m,m,m]
+        err_east, err_north, err_height \
+            = pm.geodetic2enu(latitude_estimates[0], longitude_estimates[0], pos_ref_geo[2],
+                              pos_ref_geo[0], pos_ref_geo[1], pos_ref_geo[2])
+
+        if gt_file is not None:
+            pos_enu = np.array([err_east, err_north, err_height])
+            # Get nearest point on line for all estimated points
+            nearest_point = gt_enu_line.interpolate(gt_enu_line.project(
+                sg.Point((pos_enu[0], pos_enu[1]))
+                ))
+
+            # Calculate horizontal error
+            err = np.linalg.norm(nearest_point.coords[0] - pos_enu[:2])
+        else:
+            err = np.linalg.norm(np.array([err_east, err_north]))
+
+        if np.isnan(err):
+            err = np.inf
+
+        print('(Snapper) Resulting horizontal error: {:.0f} m'.format(err))
+
+        if not 'snapper' in all_errors:
+            all_errors['snapper'] = [err]
+        else:
+            all_errors['snapper'].append(err)
+
+        ###################################################################
+        # Positioning from matlab generated code phase
+        ###################################################################
+
+        basename = os.path.basename(filename)
+        for key in source:
+            filename = os.path.join("data", key, basename + "_result.txt")
+
+            print(source)
+
+            # Read binary raw data from file
+            input = np.fromfile(filename, dtype='f4', count=64)
+            code_phases_matlab = input[:32]
+            snrs_matlab = input[32:]
+
+            # Filter out the non visible satellites
+            code_phases_matlab = {'G': np.array([(4092 - code_phases_matlab[x-1]) / 4.092e3 for x in prn_dict['G']])}
+            snrs_matlab = {'G': np.array([snrs_matlab[x-1] for x in prn_dict['G']])}
+
+            print(np.round(code_phases_matlab['G'] * 4092))
+            print(np.round(code_phase_dict['G'] * 4092))
+
+            print(np.round(snr_dict['G'], 2))
+            print(np.round(snrs_matlab['G'], 2))
+
+            error_cp_dict = code_phase_dict['G'] - code_phases_matlab['G']
+            error_snr_dict = snr_dict['G'] - snrs_matlab['G']
+
+            error_cp_dict = [error_cp_dict[id] if error_cp_dict[id] > 1e-3 else 0 for id, val in enumerate(error_cp_dict)] 
+            error_snr_dict = [error_snr_dict[id] if error_cp_dict[id] > 0 else 0 for id, val in enumerate(error_snr_dict)] 
+
+        #   error_snr_dict = error_snr_dict if error_cp_dict is not 0 else 0 
+
+            print(error_cp_dict)
+            print(error_snr_dict)
+
+            # Estimate all positions with a single function call
+            # Correct timestamps, too
+            # Finally, estimate the horizontal one-sigma uncertainty
+            latitude_estimates_matlab, longitude_estimates_matlab, time_utc_estimates_matlab, \
+                uncertainty_estimates_matlab \
+                = ctn.positioning_simplified(
+                        snapshot_idx_dict,
+                        prn_dict,
+                        code_phases_matlab,
+                        snrs_matlab,
+                        eph_dict_curr,
+                        np.array([utc]),
+                        # Initial position goes here or
+                        # if data is processed in mini-batches, last plausible position
+                        pos_geo[0], pos_geo[1], pos_geo[2],
+                        # If we could measure the height, it would go here (WGS84)
+                        observed_heights=None,
+                        # If we measure pressure & temperature, we can estimate the height
+                        pressures=None, temperatures=None,
+                        # There are 5 different modes, 'snr' is fast, but inaccurate
+                        # In the future, 'ransac' might be the preferred option
+                        ls_mode=ls_modes[mode],
+                        # Turn mle on to get a 2nd run if least-squares fails (recommended)
+                        mle=mle_modes[mode],
+                        # This parameter is crucial for speed vs. accuracy/robustness
+                        # 10-15 is good for 'snr', 10 for 'combinatorial', 15 for 'ransac'
+                        max_sat_count=max_sat_count[mode],
+                        # These parameters determine the max. spatial & temporal distance
+                        # between consecutive snapshots to be plausible
+                        # Shall depend on the application scenario
+                        max_dist=15.0e3, max_time=30.0,
+                        # If we would know an initial offset of the timestamps
+                        # If data is processed in mini-batches, the error from previous one
+                        time_error=0.0,
+                        search_space_time=search_space_time[data])
+
+            # Calculate positioning error in ENU coordinates [m,m,m]
+            err_east, err_north, err_height \
+                = pm.geodetic2enu(latitude_estimates_matlab[0], longitude_estimates_matlab[0], pos_ref_geo[2],
+                                pos_ref_geo[0], pos_ref_geo[1], pos_ref_geo[2])
+
+            if gt_file is not None:
+                pos_enu = np.array([err_east, err_north, err_height])
+                # Get nearest point on line for all estimated points
+                nearest_point = gt_enu_line.interpolate(gt_enu_line.project(
+                    sg.Point((pos_enu[0], pos_enu[1]))
+                    ))
+
+                # Calculate horizontal error
+                err = np.linalg.norm(nearest_point.coords[0] - pos_enu[:2])
+            else:
+                err = np.linalg.norm(np.array([err_east, err_north]))
+
+            if np.isnan(err):
+                err = np.inf
+
+            print('(Matlab - {}) Resulting horizontal error: {:.0f} m'.format(key, err))
+
+            if not key in all_errors:
+                all_errors[key] = [err]
+            else:                
+                all_errors[key].append(err)
+
+      # break
+
+    return all_errors #{'snapper': all_error_snapper, 'matlab': all_error_matlab}, all_time
 
 if __name__ == '__main__':
 
     np.random.seed(0)
 
     # List of folders
-    data = list(map(chr, range(ord('A'), ord('K')+1)))
-    
+    #data = list(map(chr, range(ord('A'), ord('K')+1)))
+    data = ['A']
+    source = [['A_20bins_fft4096', 'A_20bins_fft4092', 'A_40bins_fft4092', 'A_80bins_fft4092']]
+
     def write_results(all_satellites, all_snrs, all_filenames, folder):
         path = os.path.join("data", folder, 'results.txt')
         
@@ -235,10 +450,47 @@ if __name__ == '__main__':
                 file_results.write(snrs + '\n')
                         
     with futures.ProcessPoolExecutor() as pool:
-        results = pool.map(worker, data)
+        results = pool.map(worker, data, ["ls-linear"], source)
 
-        results = []
-        
-        for d in data:
-            all_satellites, all_snrs, all_filenames = worker(d)
-            write_results(all_satellites, all_snrs, all_filenames, d)
+    for id, result in enumerate(results):
+        errors = result
+        #write_results(all_satellites, all_snrs, all_filenames, data[id])
+
+    def cdf(x, plot=True, *args, **kwargs):
+        """Plot cumulative error."""
+        x, y = sorted(x), np.arange(len(x)) / len(x)
+        return plt.plot(x, y, *args, **kwargs) if plot else (x, y)
+
+    def reliable(errors):
+        """Portion of horizontal errors below 200 m."""
+        return (np.array(errors) < 200).sum(axis=0) / len(errors)
+
+    print()
+    print("(Snapper) Median horizontal error: {:.1f} m".format(np.median(errors['snapper'])))
+    print("(Snapper) Error < 200 m: {:.0%}".format(reliable(errors['snapper'])))
+
+    for key in source[0]:
+        print("(Matlab - {}) Median horizontal error: {:.1f} m".format(key, np.median(errors[key])))
+        print("(Matlab - {}) Error < 200 m: {:.0%}".format(key, reliable(errors[key])))
+        print()
+
+    # Plot CDF
+    cdf(errors['snapper'])
+
+    for key in source[0]:
+        cdf(errors[key])
+
+    plt.xlim(0, 200)
+    plt.ylim(0, 1)
+    plt.grid()
+    plt.yticks(np.linspace(0, 1, 11))
+    plt.xlabel("horizontal error [m]")
+    plt.legend(['SnapperGPS eph_acquisition', 
+    'SnapFast acquisition - 20 doppler bins - 4096 points DFT',
+    'SnapFast acquisition - 20 doppler bins - 4092 points DFT',
+    'SnapFast acquisition - 40 doppler bins - 4092 points DFT',
+    'SnapFast acquisition - 80 doppler bins - 4092 points DFT'])
+    plt.title(f"CDF of error against reference, dataset A, mode ls-linear")
+    plt.grid(True)
+
+    plt.show()
