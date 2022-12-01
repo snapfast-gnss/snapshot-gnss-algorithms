@@ -2,4 +2,10 @@
 __pycache__/
 
 # Remove data files
-data/
+data/*
+
+# Save SnapFast code_phase results
+!data/A_20bins_fft4092/
+!data/A_40bins_fft4092/
+!data/A_80bins_fft4092/
+!data/A_20bins_fft4096/
